@@ -1,8 +1,11 @@
+import torch
 import librosa
-import librosa.filters
 import numpy as np
+import torch.nn as nn
+import librosa.filters
 from scipy import signal
 from scipy.io import wavfile
+from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
 
 def load_wav(path, sr):
@@ -140,3 +143,56 @@ def _denormalize(D, allow_clipping_in_normalization=True,  # Only relevant if me
         return (((D + max_abs_value) * -min_level_db / (2 * max_abs_value)) + min_level_db)
     else:
         return ((D * -min_level_db / max_abs_value) + min_level_db)
+
+
+
+class APC_encoder(nn.Module):
+    def __init__(self,
+                 mel_dim,
+                 hidden_size,
+                 num_layers,
+                 residual):
+        super(APC_encoder, self).__init__()
+
+        input_size = mel_dim
+
+        in_sizes = ([input_size] + [hidden_size] * (num_layers - 1))
+        out_sizes = [hidden_size] * num_layers
+        self.rnns = nn.ModuleList(
+                [nn.GRU(input_size=in_size, hidden_size=out_size, batch_first=True) for (in_size, out_size) in zip(in_sizes, out_sizes)])
+
+        self.rnn_residual = residual
+    
+    def forward(self, inputs, lengths):
+        '''
+        input:
+            inputs: (batch_size, seq_len, mel_dim)
+            lengths: (batch_size,)
+
+        return:
+            predicted_mel: (batch_size, seq_len, mel_dim)
+            internal_reps: (num_layers + x, batch_size, seq_len, rnn_hidden_size),
+            where x is 1 if there's a prenet, otherwise 0
+        '''
+        with torch.no_grad():
+            seq_len = inputs.size(1)
+            packed_rnn_inputs = pack_padded_sequence(inputs, lengths, True)
+        
+            for i, layer in enumerate(self.rnns):
+                packed_rnn_outputs, _ = layer(packed_rnn_inputs)
+                
+                rnn_outputs, _ = pad_packed_sequence(
+                        packed_rnn_outputs, True, total_length=seq_len)
+                # outputs: (batch_size, seq_len, rnn_hidden_size)
+                
+                if i + 1 < len(self.rnns):
+                    rnn_inputs, _ = pad_packed_sequence(
+                            packed_rnn_inputs, True, total_length=seq_len)
+                    # rnn_inputs: (batch_size, seq_len, rnn_hidden_size)
+                    if self.rnn_residual and rnn_inputs.size(-1) == rnn_outputs.size(-1):
+                        # Residual connections
+                        rnn_outputs = rnn_outputs + rnn_inputs
+                    packed_rnn_inputs = pack_padded_sequence(rnn_outputs, lengths, True)
+        
+        
+        return rnn_outputs
